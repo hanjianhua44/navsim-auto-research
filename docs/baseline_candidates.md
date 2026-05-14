@@ -131,3 +131,121 @@
 - Hydra-MDP: NVlabs, 2024
 
 > 注：以上对训练显存 / 训练时间的估算是 Iniesta 的推断，**不是论文里给的数字**。论文里只有 DriveVLA-W0 明写了 8×L20-40GB ~16h；ReCogDrive / AutoVLA 都没给硬件耗时表。落地后请以 Messi 实测为准。
+
+---
+
+## Addendum A — ReCogDrive 上游已知坑（issue 区扫描，2026-05-14）
+
+扫了 `xiaomi-research/recogdrive` issue 区（open + closed 近 30 条），抽出对我们 Sprint 1 (Stage-2 IL + NAVSIM v1 mini) 直接有影响的几个坑。**Messi / Suarez / Xavi 上手前先看这一节**。
+
+### A.1 NumPy 1.23.* 的 `linalg.inv` bug 会让 Stage-2/3 PDMS 掉 ~5 分（issue #10）
+- **症状**: 多个用户在 H100 上跑 Stage-2 得到 0.8448、Stage-3 0.8562（论文 0.865 / 0.908）。
+- **根因**（作者 owl-10 在 #10 长楼里承认）：nuplan / NAVSIM 依赖 NumPy 1.23.* 里 `linalg.inv` 的一个数值 bug，metric_cache 在生成阶段就被算错；他们后来在新 NumPy 上重生成 cache 时引入了这条不一致路径。
+- **修复**: ① `transformers==4.37.0` + `numpy==1.26.4`；② **删掉之前的 hidden_state cache 和 metric_cache**，按最新 commit 重新生成；③ 用作者的 "Original Cache"（issue #10 楼里他放了下载链接）能直接对齐。
+- **对我们的影响**: 我们一开始就锁定 `transformers==4.37.0` / `numpy==1.26.4` / NumPy ≥ 1.24，**不要用任何 1.23.x**。Stage-2 IL 推理也受影响，复现 86.5 PDMS 必须用对版本的 cache。
+
+### A.2 NAVSIM v2 的 EC (Extended Comfort) submetric 在 v1 训的模型上崩盘（issue #74）
+- **症状**: 用 v1.1 上训出的 ReCogDrive best ckpt 直接迁到 NAVSIM v2 navtest，整体 PDMS ~83，**EC 子指标只有 30 分**（论文 v1 上是 86.5）。轨迹末尾偶尔会倒车。
+- **根因**（作者承认）：v1 训练里 BC loss 与 policy loss 不均衡，对 EP 做了 reward hacking；v2 增加了 EC 这条惩罚，把这种 hacking 暴露出来。作者说 "试了几种 alternative 还没收敛到好方案"（楼被截断没看到完整答复）。
+- **对我们的影响**: 与 D2 决策一致——**先 v1 navtest mini 起步，pipeline 通了再上 v2**；上 v2 时不能简单换数据集，需要重训 / 改 loss 配比；这是 W2 之后的事，Pep 拍 v2 之前先评估。
+
+### A.3 `run_recogdrive_accelerate.py` 里 `lr_scheduler.step()` 双重调用（issue #69，closed 但未必合入）
+- **症状**: cosine LR 提前到 last_epoch，后期 LR 一直贴 min。
+- **根因**: 脚本手动调 `lr_scheduler.step()`，而调度器已经被 `accelerator.prepare()` 包了；多卡 + grad-accum 时步数被翻倍。
+- **修复**: 提交一个 patch 去掉手动 step，让 Accelerate 管。Messi 跑 Stage-2 IL 之前确认下当前 main 是不是已经合入；没合就先打 patch。
+
+### A.4 caching 阶段 ~65% 卡死 SIGHUP（issue #65，open）
+- **症状**: `torchrun` 多卡跑 cache hidden_state，到 65k/103k 样本时主进程收到 SIGHUP 整组挂掉。
+- **作者侧**: 没复现，建议重跑。社区里另一用户 (Jezer-Zhang) 也撞到，原因不明，疑似 dataloader worker OOM 或 SSH 会话超时。
+- **对我们的影响**: caching 阶段是 Stage-2 训练前必须做的、单次跑 ~7h 的活。Messi 要么 (a) 用 `nohup` + `setsid` + `disown` 让进程脱离 controlling tty 避免 SIGHUP；(b) 在 tmux/screen 里跑；(c) 分片 cache，每个 GPU rank 单独跑一段，挂了不全死。
+
+### A.5 Stage-1 VLM 纯文本 PDM 评测脚本 (`run_internvl_agent_pdm_score_evaluation` / `run_pdm_score_internvl.py`) trajectory parse 失败（issue #70，open）
+- **症状**: 用 ReCogDrive-Base-VLM-2B 想复现 84.1 纯 VLM PDMS，输出大量 `Error parsing trajectory, returning zeros`。
+- **根因**: VLM 输出格式跟 parser 正则对不上；与 `lmdeploy` 版本敏感。
+- **作者修复建议**: `transformers==4.37.2` + 配套 `lmdeploy`，且不要改 InternVL 推理脚本参数。
+- **对我们的影响**: Stage-1 不是我们 D3 的目标（D3 只复现 Stage-2 IL），但 Suarez 做 PDMS 评测脚本接入时要意识到 "Stage-1 评测路径" 当前是坏的，**先用 Stage-2 IL 的 `run_pdm_score_recogdrive.py` 这条评测入口**，不要走 Stage-1 那条。
+
+### A.6 Stage-1 / Stage-2 之间 `old_policy.ddpm_*` 缺 key（issue #10 楼里）
+- **症状**: `strict=True` load Stage-2 weights 报 missing `action_head.old_policy.ddpm_betas/alphas/...`，`strict=False` 看似正常但实际 RL 阶段会用到。
+- **影响**: 不影响 Stage-2 IL 推理 / 训练；只在 W2 上 Stage-3 RL 时再处理。届时按作者建议显式给 `old_policy` buffer 注入初始值。
+
+### A.7 5090 / sm_120 软件栈（Xavi 主战场，我这边只列已知约束）
+- Issue 区里没有 5090 用户的报告（全是 H100 / A100 / L20）。我们是首批，雷自己趟。
+- 必要锁版本：
+  - `python==3.10`（issue #10 报告 3.9 报错）
+  - `transformers==4.37.0` （A.1 / A.5 双重要求）
+  - `numpy==1.26.4`（A.1）
+  - `torch>=2.5`、`CUDA 12.8`（5090 sm_120 最低要求；DriveVLA-W0 README 也用 12.8.1）
+  - `flash_attn==2.7.0.post2`（issue #10 作者用的版本，sm_120 上能否预编译要 Xavi 验）
+- 风险点：`flash-attn` / `xformers` / `vllm` 在 sm_120 上的预编译 wheel 现状未知；可能要从源码编译 flash-attn ≥ 2.7。
+- 建议 Xavi 优先输出一份 `docs/env_5090.md`：能 import + 能前向 + 能 backward 的最小可行版本组合。
+
+### A.8 `metric_cache` 在 NAVSIM v2 上的口径变了（社区还在踩，无 issue 但 #74 楼有暗示）
+- v1 → v2 不只是数据多了点，PDMS → EPDMS 增加了 EC、reverse penalty 等。Suarez 在写评测脚本时不要假设 v1 cache 能直接喂 v2，metric cache 必须按 v2 重新生成。
+
+---
+
+## Addendum B — Plan B / DriveVLA-W0 推理 quickstart（W2 备用）
+
+这一节给 W2 万一决定加对照 baseline 时用，不是 Sprint 1 的活儿。**只做推理 + 复现 PDMS=87.2，不训练。**
+
+### B.0 一行总结
+NAVSIM v1.1 数据 + Emu3 预训练 + 作者放出的 `Emu3_Flow_Matching_Action_Expert_PDMS_87.2` checkpoint → 跑 `infer_navsim_flow_matching_PDMS_87.2.sh` → 拿 PDMS。预计 8×5090 一天内能出数。
+
+### B.1 环境（独立 conda env，不和 ReCogDrive 串）
+```bash
+conda create -n drivevla python=3.10
+conda activate drivevla
+# CUDA 12.8 已由 Xavi 装好（见 docs/env_5090.md）
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
+git clone https://github.com/BraveGroup/DriveVLA-W0.git \
+  /home/work/hanjianhua/drivevla-w0-upstream
+cd /home/work/hanjianhua/drivevla-w0-upstream
+pip install -r requirements.txt
+```
+
+### B.2 模型权重（HF，不 gated）
+```bash
+export HF_ENDPOINT=https://hf-mirror.com    # 国内加速，可选
+export HF_TOKEN=$HF_TOKEN                    # 见 .secrets/tokens.env
+pip install huggingface_hub
+
+mkdir -p pretrained_models
+# Emu3 主干
+bash scripts/misc/download_emu3_pretrain.sh
+
+# Action expert checkpoint + 预生成测试 pickle
+huggingface-cli download liyingyan/DriveVLA-W0 \
+  Emu3_Flow_Matching_Action_Expert_PDMS_87.2 \
+  navsim_emu_vla_256_144_test_pre_1s.pkl \
+  --local-dir pretrained_models/drivevla-w0
+```
+
+### B.3 数据（NAVSIM v1.1 test split，复用 Neymar 已下载的）
+约定路径：`/home/work/hanjianhua/data/navsim/v1.1/`，需包含 `maps/`、`mini/`、`trainval/`、`test/` 子目录（与 `autonomousvision/navsim` v1.1 install.md 一致）。
+
+repo 自带的预处理脚本 **只用于训练**；纯推理走作者的预生成 `.pkl`，跳过这步。
+
+### B.4 推理 + PDMS
+```bash
+cd /home/work/hanjianhua/drivevla-w0-upstream
+
+export NUPLAN_MAPS_ROOT=/home/work/hanjianhua/data/navsim/v1.1/maps
+export NAVSIM_EXP_ROOT=/home/work/hanjianhua/drivevla-w0-upstream/exp
+export NAVSIM_DEVKIT_ROOT=/home/work/hanjianhua/recogdrive-upstream/navsim  # 复用 ReCogDrive 里内嵌的 navsim devkit；或者另装一份
+export OPENSCENE_DATA_ROOT=/home/work/hanjianhua/data/navsim/v1.1
+
+bash inference/vla/infer_navsim_flow_matching_PDMS_87.2.sh
+```
+
+### B.5 验收标准
+- navtest 全量 PDMS ≈ 87.2 (± 0.5) → 与作者数字对齐，pipeline 没问题。
+- mini split 上 PDMS 通常会比全量低 1–3 分，重点是趋势对、能正常评出 EP / DAC / TTC / Comfort 各子项，不要看绝对值。
+
+### B.6 已知风险
+- DriveVLA-W0 README 明说 **"Due to company policy, only the reviewed part of our codebase is available"**：训练全链路可能不全，但**推理路径作者明确放了脚本**，所以做 Plan B（只推理）风险可控。
+- Emu3 视觉 tokenizer 的 VQ 索引和 NAVSIM 帧数 / 分辨率绑死（256×144），如果我们后期想换分辨率，重新生成 VQ index 是工程量。
+- 该模型只在 NAVSIM v1.1 测过，**v2 navtest 没有官方数字**，迁 v2 与 ReCogDrive 同样面对 EC submetric 的问题。
