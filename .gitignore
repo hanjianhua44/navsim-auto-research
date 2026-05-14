@@ -1,12 +1,30 @@
-.secrets/
-*.pyc
-__pycache__/
+# --- venvs (we have several, all heavy) ---
+env/py*-navsim*/
+env/logs/
 .venv/
-venv/
-wandb/
-outputs/
-checkpoints/
-*.ckpt
-*.pt
+
+# --- third party clones (we pin them via download scripts, not git submodules
+#     for now — too heavy and we patch them) ---
+third_party/
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- data (NEVER commit dataset blobs) ---
 data/
-.env
+*.db
+*.pkl
+*.pt
+*.ckpt
+
+# --- editor / OS ---
+.idea/
+.vscode/
+.DS_Store
+*.swp
