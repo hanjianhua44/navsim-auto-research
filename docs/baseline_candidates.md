@@ -141,8 +141,9 @@
 ### A.1 NumPy 1.23.* 的 `linalg.inv` bug 会让 Stage-2/3 PDMS 掉 ~5 分（issue #10）
 - **症状**: 多个用户在 H100 上跑 Stage-2 得到 0.8448、Stage-3 0.8562（论文 0.865 / 0.908）。
 - **根因**（作者 owl-10 在 #10 长楼里承认）：nuplan / NAVSIM 依赖 NumPy 1.23.* 里 `linalg.inv` 的一个数值 bug，metric_cache 在生成阶段就被算错；他们后来在新 NumPy 上重生成 cache 时引入了这条不一致路径。
-- **修复**: ① `transformers==4.37.0` + `numpy==1.26.4`；② **删掉之前的 hidden_state cache 和 metric_cache**，按最新 commit 重新生成；③ 用作者的 "Original Cache"（issue #10 楼里他放了下载链接）能直接对齐。
-- **对我们的影响**: 我们一开始就锁定 `transformers==4.37.0` / `numpy==1.26.4` / NumPy ≥ 1.24，**不要用任何 1.23.x**。Stage-2 IL 推理也受影响，复现 86.5 PDMS 必须用对版本的 cache。
+- **修复**: ① `transformers==4.37.2` + `numpy==1.26.4`；② **删掉之前的 hidden_state cache 和 metric_cache**，按最新 commit 重新生成；③ 用作者的 "Original Cache"（issue #10 楼里他放了下载链接）能直接对齐。
+- **对我们的影响**: 我们一开始就锁定 `transformers==4.37.2` / `numpy==1.26.4` / NumPy ≥ 1.24，**不要用任何 1.23.x**。Stage-2 IL 推理也受影响，复现 86.5 PDMS 必须用对版本的 cache。
+- **证据链**: `numpy==1.26.4` 硬钉在 [`recogdrive/requirements.txt`](https://github.com/xiaomi-research/recogdrive/blob/main/requirements.txt)；`transformers==4.37.2` 钉在 [`recogdrive/internvl_chat/pyproject.toml`](https://github.com/xiaomi-research/recogdrive/blob/main/internvl_chat/pyproject.toml#L13)（反验：issue #70 里作者也建议升级到 4.37.2）。我之前写的 `transformers==4.37.0` 是从 issue #10 楼主的环境部分调出来的，**不是作者的推荐**。以 **4.37.2 为准**。
 
 ### A.2 NAVSIM v2 的 EC (Extended Comfort) submetric 在 v1 训的模型上崩盘（issue #74）
 - **症状**: 用 v1.1 上训出的 ReCogDrive best ckpt 直接迁到 NAVSIM v2 navtest，整体 PDMS ~83，**EC 子指标只有 30 分**（论文 v1 上是 86.5）。轨迹末尾偶尔会倒车。
@@ -169,16 +170,25 @@
 - **症状**: `strict=True` load Stage-2 weights 报 missing `action_head.old_policy.ddpm_betas/alphas/...`，`strict=False` 看似正常但实际 RL 阶段会用到。
 - **影响**: 不影响 Stage-2 IL 推理 / 训练；只在 W2 上 Stage-3 RL 时再处理。届时按作者建议显式给 `old_policy` buffer 注入初始值。
 
-### A.7 5090 / sm_120 软件栈（Xavi 主战场，我这边只列已知约束）
+### A.7 5090 / sm_120 软件栈（Xavi 主战场，我这边只列上游硬约束）
+
+> **勘误（Iniesta，2026-05-14）**：本节 v1 写了 `python==3.10`，是我从 issue #10 楼主的环境报告里脑补出来的，**不是上游要求**。上游硬钉 **Python 3.9**。详见下面的证据。
+
 - Issue 区里没有 5090 用户的报告（全是 H100 / A100 / L20）。我们是首批，雷自己趟。
-- 必要锁版本：
-  - `python==3.10`（issue #10 报告 3.9 报错）
-  - `transformers==4.37.0` （A.1 / A.5 双重要求）
-  - `numpy==1.26.4`（A.1）
-  - `torch>=2.5`、`CUDA 12.8`（5090 sm_120 最低要求；DriveVLA-W0 README 也用 12.8.1）
-  - `flash_attn==2.7.0.post2`（issue #10 作者用的版本，sm_120 上能否预编译要 Xavi 验）
-- 风险点：`flash-attn` / `xformers` / `vllm` 在 sm_120 上的预编译 wheel 现状未知；可能要从源码编译 flash-attn ≥ 2.7。
-- 建议 Xavi 优先输出一份 `docs/env_5090.md`：能 import + 能前向 + 能 backward 的最小可行版本组合。
+- **上游硬约束**（证据优先级：上游 setup.py / environment.yml > 作者 issue 回覆 > 社区用户报告）：
+  - `python=3.9` —— [environment.yml](https://github.com/xiaomi-research/recogdrive/blob/main/environment.yml) 钉 `python=3.9`；[setup.py](https://github.com/xiaomi-research/recogdrive/blob/main/setup.py) 写 `python_requires=">=3.9"` + `Programming Language :: Python :: 3.9`。同时注意 setup.py 里 `name="navsim" version="1.1.0"` —— ReCogDrive 是将 `autonomousvision/navsim` v1.1.0 fork 进来改的，**两者共享同一份 Python 约束**。
+  - `numpy==1.26.4` —— [requirements.txt](https://github.com/xiaomi-research/recogdrive/blob/main/requirements.txt) 硬钉。
+  - `transformers==4.37.2` —— [internvl_chat/pyproject.toml](https://github.com/xiaomi-research/recogdrive/blob/main/internvl_chat/pyproject.toml#L13) 硬钉。
+  - `tokenizers==0.15.1`、`deepspeed==0.13.5`、`timm==0.9.12`、`bitsandbytes==0.41.0` —— 同上 `pyproject.toml`。
+  - `nuplan-devkit @ git+https://github.com/motional/nuplan-devkit/@nuplan-devkit-v1.2` —— `requirements.txt`。
+- **与 sm_120 交集的依赖（上游未钉版本，我们需要自己选）**：
+  - `torch>=2.5` + `CUDA 12.8`（5090 / Blackwell 最低要求；DriveVLA-W0 README 也默认用 12.8.1）
+  - `flash_attn`（社区参考值 2.7.0.post2，但 sm_120 预编译 wheel 是否存在未知）
+- **硬冲突（需要 Pep 拍）**：上游钉 `python=3.9` 与 PyTorch nightly cu128 指定的 "最低 cp310"相冲。三条路：
+  1. **改 py3.10 + cu128 nightly**（Xavi 推荐）。代价：偏离上游 py3.9 约束，理论上 nuplan-devkit v1.2 的 3.9-only 语法可能踩霐；反面依据：issue #10 主楼就是 py3.10.0 开跑并最终跟作者对齐到 PDMS=0.901，【作者本人没反对】，表明 py3.10 在 ReCogDrive + nuplan-devkit v1.2 组合下**实测可跑**。
+  2. py3.9 + 自己编 torch from source（一次 1–2h + 后续每次升级重新造轮）。
+  3. py3.9 + 等官方 cp39 cu128 wheel。**不可选**：PyTorch 从 2.5 起已停 py3.9 的 nightly 发布。
+- **Iniesta 的实证倾向**：走方案 1。证据：反部署询问完 issue 区后，**没有一例 py3.10 结合 ReCogDrive 失败的报告**；反者 H100 / SLURM 上 py3.10 能复现到 0.901。但是 Pep 拍。
 
 ### A.8 `metric_cache` 在 NAVSIM v2 上的口径变了（社区还在踩，无 issue 但 #74 楼有暗示）
 - v1 → v2 不只是数据多了点，PDMS → EPDMS 增加了 EC、reverse penalty 等。Suarez 在写评测脚本时不要假设 v1 cache 能直接喂 v2，metric cache 必须按 v2 重新生成。
